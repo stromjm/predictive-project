@@ -1,0 +1,485 @@
+---
+title: "Final Project"
+author: "Joelle Strom"
+date: "12/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# AirBnB
+
+## EDA
+
+```{r}
+train <- read.csv("D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/airbnb.train.csv")
+head(train)
+#Possible important variables: neighbourhood_group, latitude, longitude, room_type, number_of_reviews, reviews_per_month, availability_365
+#Will not attempt to use id, name, host_id, host_name, last_review, or neighbourhood
+
+train <- transform(train,
+                room_type = as.factor(room_type),
+                neighbourhood_group = as.factor(neighbourhood_group))
+summary(train) #Some variables have NAs
+train[1:50,]
+sum(train$number_of_reviews[which(is.na(train$reviews_per_month))]) #The NAs appear to be in review variables where total # of reviews = 0, so the NAs in reviews_per_month will be replaced with 0s
+train$reviews_per_month[is.na(train$reviews_per_month)] <- 0 #Replace NAs with 0
+train$logprice <- log(train$price + 1) #Will use transformed variable due to large range and right skew
+
+summary(train) #No NA values in predictors that will be used or in response
+
+library(ggplot2)
+ggplot(train, aes(room_type, price)) + geom_violin() #Some very high outliers, but it appears that shared rooms have a lower price ceiling overall. Private rooms have higher density at lower prices than entire home/apt
+ggplot(train, aes(neighbourhood_group, price)) + geom_violin() #Manhattan and Brooklyn have higher prices than the other 3; Bronx has the lowest prices, followed by Queens
+ggplot(train, aes(latitude, price)) + geom_point() + geom_smooth() #Latitudes near 40.5 have high prices, then there's a dip, then a rise, then another fall. This seems to have an effect in a non-linear fashion
+ggplot(train, aes(longitude, price)) + geom_point() + geom_smooth() #Prices increase as longitude increases up to a certain point, then prices fall and essentially stabilize. This also seems to have an effect in a non-linear fashion
+ggplot(train, aes(number_of_reviews, price)) + geom_point() + geom_smooth() #This has a very slight downward linear trend, don't expect this predictor to be very important
+ggplot(train, aes(reviews_per_month, price)) + geom_point() + geom_smooth() #This has a stronger downward linear trend than number_of_reviews
+ggplot(train, aes(availability_365, price)) + geom_point() + geom_smooth() #Price increases as availability increases, before a sudden dip and then drastic climb. This has an effect in a non-linear fashion
+ggplot(train, aes(minimum_nights, price)) + geom_point() + geom_smooth() #After an early spike, this trend decreases and has a slight negative parabolic shape. This has an effect in a non-linear fashion, unable to tell how strong this variable might be as a predictor
+ggplot(train, aes(calculated_host_listings_count, price)) + geom_point() + geom_smooth() #After some quick oscillations, price dramatically increases as host listings increase
+
+#Take a look at top listings
+ord <- train[order(train$price, decreasing=TRUE),]
+ord[1:20,]
+#No apparent patterns in the text variables (or otherwise)
+
+library(Boruta)
+airbnb.bor <- Boruta(price ~ room_type + neighbourhood_group + longitude + latitude + number_of_reviews + reviews_per_month + availability_365
+       + minimum_nights + calculated_host_listings_count, data=train)
+print(airbnb.bor)
+plot(airbnb.bor)
+#All attributes deemed important- all will remain in models
+
+avgimp <- apply(airbnb.bor$ImpHistory, 2, FUN=mean)
+avgimp[order(avgimp, decreasing=TRUE)]
+#Top 5 predictors are room_type, availability_365, calculated_host_listings_count, minimum_nights, and reviews_per_month
+```
+
+## Modelling
+
+```{r}
+library(caret)
+library(xgboost)
+library(gam)
+library(doParallel)
+
+xgbGrid <- expand.grid(max_depth = c(1, 2, 3),
+                       eta = c(0.01, 0.1, 0.3),
+                       colsample_bytree = c(0.6, 0.8),
+                       subsample = c(0.5, 0.75, 1),
+                       nrounds = c(100, 500, 1500),
+                       gamma = 0,
+                       min_child_weight = 1)
+
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+start.time <- proc.time()
+
+#Train a boosted tree model
+cv.5 <- trainControl(method="cv", number=5)
+xgb.cv <- train(logprice ~ room_type + neighbourhood_group + longitude + latitude + number_of_reviews + reviews_per_month +
+                    availability_365 + minimum_nights + calculated_host_listings_count, data=train, method="xgbTree",
+                    trControl=cv.5, tuneGrid=xgbGrid)
+xgb.cv #Final tuning parameters: nrounds=1500, max_depth=3, eta=0.1, gamma=0, colsample_bytree=0.8, min_child_weight=1, and subsample=0.75
+stopCluster(cl)
+#But maybe a different number of trees will reduce test error
+
+#Set up k-fold CV
+set.seed(18)
+k <- 5
+n <- nrow(train)
+fold <- sample(rep(1:k, length=n), replace=FALSE)
+
+train.mat <- model.matrix(logprice ~ room_type + neighbourhood_group + longitude + latitude + number_of_reviews +
+                            reviews_per_month + availability_365 + minimum_nights + calculated_host_listings_count,
+                         data=train)
+nr <- c(750, 1000, 1500, 2000)
+yhat.xgb <- data.frame("750" = rep(0, nrow(train)),
+                       "1000" = rep(0, nrow(train)),
+                       "1500" = rep(0, nrow(train)),
+                       "2000" = rep(0, nrow(train)))
+rmse <- rep(0,4)
+for(i in 1:length(nr)){
+  set.seed(18)
+  for(j in 1:k){
+    xgb.out <- xgboost(data=train.mat[fold != j,], label=train$logprice[fold != j], eta=0.1, max_depth=3, gamma=0,
+                       colsample_bytree=0.8, min_child_weight=1, subsample=0.75, nrounds=nr[i])
+    yhat.xgb[fold == j, i] <- predict(xgb.out, train.mat[fold == j,])
+  }
+  rmse[i] <- sqrt(mean((yhat.xgb[,i] - train$logprice)**2))
+}
+rmse #750 rounds is the best option
+
+pred.xgb <- exp(yhat.xgb[,4])-1
+sqrt(mean((pred.xgb-train$price)**2))
+
+#Train a GAM with splines
+d <- c(1:10) #Train longitude
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude, df=d[i]) + s(latitude)
+                              + s(number_of_reviews) + s(reviews_per_month) + s(availability_365)
+                              + s(minimum_nights) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+d <- c(1:10) #Train latitude
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude, df=d[i])
+                              + s(number_of_reviews) + s(reviews_per_month) + s(availability_365)
+                              + s(minimum_nights) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+d <- c(1:10) #Train number of reviews
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude)
+                              + s(number_of_reviews, df=d[i]) + s(reviews_per_month) + s(availability_365)
+                              + s(minimum_nights) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+d <- c(1:10) #Train reviews per month
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude)
+                              + s(number_of_reviews) + s(reviews_per_month, df=d[i]) + s(availability_365)
+                              + s(minimum_nights) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+d <- c(1:10) #Train availability
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude)
+                              + s(number_of_reviews) + s(reviews_per_month) + s(availability_365, df=d[i])
+                              + s(minimum_nights) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+d <- c(1:10) #Train minimum nights
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude)
+                              + s(number_of_reviews) + s(reviews_per_month) + s(availability_365)
+                              + s(minimum_nights, df=d[i]) + s(calculated_host_listings_count), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #9
+
+d <- c(1:10) #Train host listings
+mse <- rep(0,10)
+for (i in 1:10){
+  set.seed(18)
+  yhat <- rep(NA, nrow(train))
+  for (j in 1:k){
+    a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude) + s(latitude)
+                              + s(number_of_reviews) + s(reviews_per_month) + s(availability_365)
+                              + s(minimum_nights) + s(calculated_host_listings_count, df=d[i]), 
+                              data = train[fold != j,]))
+    yhat[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+  }
+  mse[i] <- sqrt(mean((yhat - train$logprice)**2))
+}
+d[which.min(mse)] #10
+
+#Train FULL model
+set.seed(18)
+yhat.gam <- rep(NA, nrow(train))
+for (j in 1:k){
+  a <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude, df=10) + s(latitude, df=10)
+                            + s(number_of_reviews, df=10) + s(reviews_per_month, df=10) + s(availability_365, df=10)
+                            + s(minimum_nights, df=9) + s(calculated_host_listings_count, df=10), 
+                            data = train[fold != j,]))
+  yhat.gam[fold == j] <- suppressWarnings(predict(a, train[fold == j,]))
+}
+sqrt(mean((yhat.gam - train$logprice)**2))
+pred.gam <- exp(yhat.gam)-1
+sqrt(mean((pred.gam-train$price)**2))
+
+ensemble <- (pred.gam + pred.xgb) / 2
+sqrt(mean((ensemble-train$price)**2))
+```
+
+## Make Predictions
+
+```{r}
+#Fit final models
+xgb.final <- xgboost(data=train.mat, label=train$logprice, eta=0.1, max_depth=3, gamma=0,
+                       colsample_bytree=0.8, min_child_weight=1, subsample=0.75, nrounds=750)
+gam.final <- suppressWarnings(gam(logprice ~ room_type + neighbourhood_group + s(longitude, df=10) + s(latitude, df=10)
+                            + s(number_of_reviews, df=10) + s(reviews_per_month, df=10) + s(availability_365, df=10)
+                            + s(minimum_nights, df=9) + s(calculated_host_listings_count, df=10), 
+                            data = train))
+
+test <- read.csv("D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/airbnb.test.csv")
+test <- transform(test,
+                room_type = as.factor(room_type),
+                neighbourhood_group = as.factor(neighbourhood_group))
+test$reviews_per_month[is.na(test$reviews_per_month)] <- 0 #Replace NAs with 0
+
+test.mat <- model.matrix(~room_type + neighbourhood_group + longitude + latitude + number_of_reviews +
+                            reviews_per_month + availability_365 + minimum_nights + calculated_host_listings_count,
+                         data=test)
+
+test.xgb <- predict(xgb.final, test.mat)
+test.gam <- suppressWarnings(predict(gam.final, test))
+test.xgb <- exp(test.xgb) - 1
+test.gam <- exp(test.gam) - 1
+test.ens <- (test.xgb + test.gam) / 2
+final.xgb <- cbind(test$id, test.xgb)
+colnames(final.xgb) <- c("id", "price")
+final.gam <- cbind(test$id, test.gam)
+colnames(final.gam) <- c("id", "price")
+final.ens <- cbind(test$id, test.ens)
+colnames(final.ens) <- c("id", "price")
+write.csv(final.xgb, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.airbnb.xgb.csv", row.names=FALSE)
+write.csv(final.gam, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.airbnb.gam.csv", row.names=FALSE)
+write.csv(final.ens, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.airbnb.ens.csv", row.names=FALSE)
+
+#Best model is XGBoost with nrounds=750, max_depth=3, eta=0.1, gamma=0, colsample_bytree=0.8, min_child_weight=1, and subsample=0.75
+```
+
+# Rain in Australia
+
+## EDA
+
+```{r}
+train <- read.csv("D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/rain.train.csv")
+head(train)
+summary(train) #Will not try to use id, date; will try to factor location, wind_gust_dir, wind_dir9am, wind_dir3pm
+#Might try to factor evaporation and sunshine
+#NAs in min_temp, max_temp, rainfall, wind_gust_speed, wind_speed9am, wind_speed3pm, humidity9am, humidity3pm, pressure9am, pressure3pm, cloud9am, clous3pm, temp9am, temp3pm, rain_today; will try to impute
+
+train <- transform(train,
+                   location = as.factor(location),
+                   wind_gust_dir = as.factor(wind_gust_dir),
+                   wind_dir9am = as.factor(wind_dir9am),
+                   wind_dir3pm = as.factor(wind_dir3pm),
+                   evaporation = as.factor(evaporation),
+                   sunshine = as.factor(sunshine))
+
+summary(train)
+length(levels(train$location))
+length(levels(train$wind_gust_dir))
+length(levels(train$wind_dir3pm))
+length(levels(train$wind_dir9am))
+#These variables have a large number of levels, which will slow down model training. Will leave out location, but will try to keep the others in initial models
+
+library(mice)
+imp <- mice(train, m=5, method='pmm', seed=1800)
+train.comp <- complete(imp, 3)
+
+summary(train.comp) #No more NA values
+
+#Variable design
+#What if the difference in predictors over the course of the day holds some information?
+train.comp$tempdiff <- train.comp$max_temp - train.comp$min_temp
+train.comp$winddiff <- train.comp$wind_speed3pm - train.comp$wind_speed9am
+train.comp$humdiff <- train.comp$humidity3pm - train.comp$humidity9am
+train.comp$presdiff <- train.comp$pressure3pm - train.comp$pressure9am
+train.comp$clouddiff <- train.comp$cloud3pm - train.comp$cloud9am
+train.comp$small.tempdiff <- train.comp$temp3pm - train.comp$temp9am
+
+write.csv(train.comp, file="D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/rain.train.comp.csv")
+#Write CSV to return to this data set later so that this imputation does not need to be re-run
+
+#Lots of possible predictors, use Boruta to find the more important ones
+library(Boruta)
+library(doParallel)
+
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+set.seed(1800)
+rain.bor <- Boruta(rain_tomorrow ~ . - id - date - location, data=train.comp)
+print(rain.bor)
+plot(rain.bor)
+
+stopCluster(cl)
+
+#All features deemed important, all will be left in the model
+#Look at some visualizations of most important predictors
+avgimp <- apply(rain.bor$ImpHistory, 2, FUN=mean)
+avgimp[order(avgimp, decreasing=TRUE)]
+
+#Top 5 predictors are: humidity3pm, wind_gust_speed, cloud3pm, pressure3pm, pressure9am
+
+library(ggplot2)
+ggplot(aes(humidity3pm,factor(rain_tomorrow)),data=train.comp) + geom_violin()
+ggplot(aes(wind_gust_speed,factor(rain_tomorrow)),data=train.comp) + geom_violin()
+ggplot(aes(cloud3pm,factor(rain_tomorrow)),data=train.comp) + geom_violin()
+ggplot(aes(pressure3pm,factor(rain_tomorrow)),data=train.comp) + geom_violin()
+ggplot(aes(pressure9am,factor(rain_tomorrow)),data=train.comp) + geom_violin()
+```
+
+## Modelling
+
+```{r}
+library(caret)
+library(xgboost)
+library(nnet)
+
+xgbGrid <- expand.grid(max_depth = c(1, 2, 3),
+                       eta = c(0.01, 0.1, 0.3),
+                       colsample_bytree = c(0.6, 0.8),
+                       subsample = c(0.5, 0.75, 1),
+                       nrounds = c(100, 500, 1500),
+                       gamma = 0,
+                       min_child_weight = 1)
+
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+#Train a boosted tree model
+cv.5 <- trainControl(method="cv", number=5)
+xgb.cv <- train(factor(rain_tomorrow) ~ . - id - date - location, data=train.comp, method="xgbTree",
+                    trControl=cv.5, tuneGrid=xgbGrid)
+xgb.cv #Final tuning parameters: nrounds=500, max_depth=3, eta=0.1, gamma=0, colsample_bytree=0.6, min_child_weight=1, and subsample=0.5
+stopCluster(cl)
+
+#Try different numbers of trees
+set.seed(18)
+k <- 5
+n <- nrow(train.comp)
+fold <- sample(rep(1:k, length=n), replace=FALSE)
+
+train.mat <- model.matrix(factor(rain_tomorrow) ~ . - id - date - location, data=train.comp)
+nr <- c(250, 500, 750, 1000)
+yhat.xgb <- data.frame("250" = rep(0, nrow(train.comp)),
+                       "500" = rep(0, nrow(train.comp)),
+                       "750" = rep(0, nrow(train.comp)),
+                       "1000" = rep(0, nrow(train.comp)))
+logl <- rep(0,4)
+for(i in 1:length(nr)){
+  set.seed(18)
+  for(j in 1:k){
+    xgb.out <- xgboost(data=train.mat[fold != j,], label=train.comp$rain_tomorrow[fold != j], eta=0.1, max_depth=3, gamma=0,
+                       colsample_bytree=0.6, min_child_weight=1, subsample=0.5, nrounds=nr[i])
+    yhat.xgb[fold == j, i] <- predict(xgb.out, train.mat[fold == j,])
+  }
+  yhat.xgb[,i] <- ifelse(yhat.xgb[,i] < 0, yes=9*10**(-15), no=yhat.xgb[,i])
+  yhat.xgb[,i] <- ifelse(yhat.xgb[,i] > 1, yes=1-9*10**(-15), no=yhat.xgb[,i])
+  logl[i] <- mean(-(train.comp$rain_tomorrow*log(yhat.xgb[,i]) + (1-train.comp$rain_tomorrow)*log(1-yhat.xgb[,i])))
+}
+logl #250 rounds is the best option
+
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+
+#Train a boosted tree model
+cv.5 <- trainControl(method="cv", number=5)
+nnet.cv <- train(factor(rain_tomorrow) ~ . - id - date - location, data=train.comp, method="nnet", trControl=cv.5)
+nnet.cv #Final tuning parameters: size=3, decay=0.1
+stopCluster(cl)
+
+yhat.nnet <- rep(0, nrow(train.comp))
+set.seed(18)
+for(j in 1:k){
+  nnet.out <- nnet(x=train.mat[fold != j,], y=train.comp$rain_tomorrow[fold != j], size=3, decay=0.1)
+  yhat.nnet[fold == j] <- predict(nnet.out, newdata=train.mat[fold == j,])
+}
+yhat.nnet <- ifelse(yhat.nnet < 0, yes=9*10**(-15), no=yhat.nnet)
+yhat.nnet <- ifelse(yhat.nnet > 1, yes=1-9*10**(-15), no=yhat.nnet)
+mean(-(train.comp$rain_tomorrow*log(yhat.nnet) + (1-train.comp$rain_tomorrow)*log(1-yhat.nnet))) #LogL
+#Slightly more accurate than the boosted tree model
+
+yhat.ens <- (yhat.xgb[,1] + yhat.nnet) / 2
+mean(-(train.comp$rain_tomorrow*log(yhat.ens) + (1-train.comp$rain_tomorrow)*log(1-yhat.ens))) #LogL
+#An average of the two models is better??
+```
+
+## Make Predictions
+
+```{r}
+set.seed(18)
+xgb.final <- xgboost(data=train.mat, label=train.comp$rain_tomorrow, eta=0.1, max_depth=3, gamma=0,
+                       colsample_bytree=0.6, min_child_weight=1, subsample=0.5, nrounds=250)
+nnet.final <- nnet(x=train.mat, y=train.comp$rain_tomorrow, size=3, decay=0.1)
+
+test <- read.csv("D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/rain.test.csv")
+test <- transform(test,
+                   location = as.factor(location),
+                   wind_gust_dir = as.factor(wind_gust_dir),
+                   wind_dir9am = as.factor(wind_dir9am),
+                   wind_dir3pm = as.factor(wind_dir3pm),
+                   evaporation = as.factor(evaporation),
+                   sunshine = as.factor(sunshine))
+
+imp <- mice(test, m=5, method='pmm', seed=1800)
+test.comp <- complete(imp, 3)
+
+summary(test.comp) #No more NA values
+
+test.comp$tempdiff <- test.comp$max_temp - test.comp$min_temp
+test.comp$winddiff <- test.comp$wind_speed3pm - test.comp$wind_speed9am
+test.comp$humdiff <- test.comp$humidity3pm - test.comp$humidity9am
+test.comp$presdiff <- test.comp$pressure3pm - test.comp$pressure9am
+test.comp$clouddiff <- test.comp$cloud3pm - test.comp$cloud9am
+test.comp$small.tempdiff <- test.comp$temp3pm - test.comp$temp9am
+
+test.mat <- model.matrix(~ . - id - date - location, data=test.comp)
+
+test.xgb <- predict(xgb.final, test.mat)
+test.xgb <- ifelse(test.xgb < 0, yes=9*10**(-15), no=test.xgb)
+test.xgb <- ifelse(test.xgb > 1, yes=1-9*10**(-15), no=test.xgb)
+test.nnet <- predict(nnet.final, test.mat)
+test.nnet <- ifelse(test.nnet < 0, yes=9*10**(-15), no=test.nnet)
+test.nnet <- ifelse(test.nnet > 1, yes=1-9*10**(-15), no=test.nnet)
+test.ens <- (test.xgb + test.nnet) / 2
+final.xgb <- cbind(test.comp$id, test.xgb)
+colnames(final.xgb) <- c("id", "rain_tomorrow")
+final.nnet <- cbind(test.comp$id, test.nnet)
+colnames(final.nnet) <- c("id", "rain_tomorrow")
+final.ens <- cbind(test.comp$id, test.ens)
+colnames(final.ens) <- c("id", "rain_tomorrow")
+write.csv(final.xgb, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.rain.xgb.csv", row.names=FALSE)
+write.csv(final.nnet, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.rain.nnet.csv", row.names=FALSE)
+write.csv(final.ens, "D:/Documents/Applied Stats MS/Fall 2021/STAT 488_001/final.rain.ens.csv", row.names=FALSE)
+```
